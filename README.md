@@ -20,6 +20,7 @@ drawing, and score points for accurate guesses.
 2. [Run the game on your computer](#2-run-the-game-on-your-computer)
 3. [Play with friends on the same wifi](#3-play-with-friends-on-the-same-wifi)
 4. [Put it online for free (Cloudflare)](#4-put-it-online-for-free-cloudflare)
+   - [Optional: website on Vercel](#optional-host-the-website-on-vercel)
 5. [Change the game's name or web address](#5-change-the-games-name-or-web-address)
 6. [Add your own words](#6-add-your-own-words)
 7. [What does it cost?](#7-what-does-it-cost)
@@ -118,6 +119,31 @@ that anyone can open from anywhere.
 Whenever you change something (like adding words), just run `npm run deploy`
 again to update the online version.
 
+### Optional: host the website on Vercel
+
+You can put the **website** on Vercel (link like `https://doodle-chain.vercel.app`)
+while the **game server** stays on Cloudflare. The game server has to stay on
+Cloudflare: it keeps one always-on "referee" per room, which Vercel doesn't
+offer. Both are free.
+
+1. First do all of step 4 above. Write down your Cloudflare link, e.g.
+   `https://doodle-chain.yourname.workers.dev` — that's your **game server address**.
+2. Create a free account at https://vercel.com/signup and choose **Continue with GitHub**.
+3. Click **Add New… → Project**, find **dodo-doodle-** in the list and click **Import**.
+4. Before clicking Deploy, open **Environment Variables** and add one:
+   - **Key:** `VITE_GAME_SERVER`
+   - **Value:** your game server address from step 1 (no slash at the end)
+5. Click **Deploy**. Vercel reads the rest of the setup from `vercel.json`.
+   When it finishes you get a link like `https://dodo-doodle.vercel.app`. Share that one!
+
+From then on, Vercel updates the website automatically every time the `main`
+branch on GitHub changes. If you change the **game server** code
+(`worker/` or `shared/`), also run `npm run deploy` so Cloudflare gets it too.
+
+If you ever change the game server address, update `VITE_GAME_SERVER` in
+Vercel (**Project → Settings → Environment Variables**) and click **Redeploy**
+on the latest deployment.
+
 ## 5. Change the game's name or web address
 
 Open **`wrangler.jsonc`** in any text editor (Notepad, TextEdit, VS Code…) and
@@ -188,6 +214,8 @@ npm run deploy
 | "Reconnecting…" banner | The internet blinked. It reconnects by itself; you land back in the same turn with your drawing restored. |
 | "This game is already in progress" | New players can only join in the lobby. Wait for the host to press **Play again**. |
 | `wrangler login` doesn't open a browser | Copy the link the terminal prints into your browser. |
+| Vercel build fails with "VITE_GAME_SERVER is not set" | Add the environment variable from the Vercel steps above, then redeploy. |
+| Vercel site loads but "Couldn't create a room" | Check `VITE_GAME_SERVER` is exactly your Cloudflare link (starts with `https://`, no slash at the end), and that `npm run deploy` finished. |
 
 ## 9. For the curious: how it's built
 
