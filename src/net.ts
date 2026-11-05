@@ -4,7 +4,14 @@
 
 import { useSyncExternalStore } from "react";
 import type { ClientMsg, ErrorCode, PublicRoom, ServerMsg, Step, Task } from "../shared/types";
-import { wsUrl } from "./server";
+import { apiUrl, wsUrl } from "./server";
+
+/**
+ * How the browser talks to the game server:
+ *  - "ws"   (Cloudflare): one live WebSocket.
+ *  - "poll" (Vercel): check in over plain HTTP every second or so.
+ */
+const POLL = import.meta.env.VITE_TRANSPORT === "poll";
 import { storage } from "./storage";
 
 export type Status = "idle" | "connecting" | "open" | "reconnecting";
@@ -98,12 +105,18 @@ class GameClient {
   leave() {
     this.wanted = null;
     this.pending = [];
+    this.pollQueue = [];
+    this.lastReactionId = 0;
     storage.setSession(null);
     this.teardown();
     this.set({ ...initial });
   }
 
   private teardown() {
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+    this.pollGen++;
+    this.polling = false;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.retryTimer = null;
@@ -126,6 +139,14 @@ class GameClient {
     this.teardown();
     const w = this.wanted;
     if (!w) return;
+    if (POLL) {
+      const session = storage.session();
+      this.token = session && session.code === w.code ? session.token : "";
+      this.v = -1;
+      this.pollQueue = [{ type: "join", name: w.name, colour: w.colour, token: this.token || undefined }];
+      this.schedulePoll(0);
+      return;
+    }
     const ws = new WebSocket(wsUrl(`/api/room/${w.code}/ws`));
     this.ws = ws;
 
@@ -171,6 +192,14 @@ class GameClient {
   private flushOnState = false;
 
   send(msg: ClientMsg) {
+    if (POLL) {
+      if (msg.type === "ping" || !this.wanted) return;
+      // Only the newest autosave matters.
+      if (msg.type === "autosave") this.pollQueue = this.pollQueue.filter((m) => m.type !== "autosave");
+      this.pollQueue.push(msg);
+      if (!this.polling) this.schedulePoll(0);
+      return;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.state.status === "open") {
       this.ws.send(JSON.stringify(msg));
     } else if (msg.type === "submit" || msg.type === "autosave") {
@@ -181,9 +210,96 @@ class GameClient {
 
   /** Called when the page becomes visible again (phones pause sockets in the background). */
   wake() {
+    if (POLL) {
+      if (this.wanted && !this.polling) this.schedulePoll(0);
+      return;
+    }
     if (this.wanted && !this.ws && this.state.status === "reconnecting") {
       this.attempts = 0;
       this.open();
+    }
+  }
+
+  // ---------------- polling (Vercel)
+  private token = "";
+  private v = -1;
+  private pollQueue: ClientMsg[] = [];
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private polling = false;
+  private pollGen = 0;
+  private lastReactionId = 0;
+
+  private schedulePoll(ms: number) {
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = setTimeout(() => void this.pollOnce(), ms);
+  }
+
+  private pollInterval(): number {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return 5000;
+    const phase = this.state.room?.phase;
+    if (phase === "reveal") return 1000;
+    if (phase === "scores") return 2500;
+    return 1500;
+  }
+
+  private async pollOnce() {
+    const w = this.wanted;
+    if (!w || this.polling) return;
+    this.polling = true;
+    const gen = this.pollGen;
+    const msgs = this.pollQueue.splice(0, 20);
+    const room = this.state.room;
+    const rc = room?.phase === "reveal" && room.reveal ? room.reveal.chain : -1;
+    let have = 0;
+    const steps = rc >= 0 ? this.state.chains[rc]?.steps : undefined;
+    while (steps && steps[have]) have++;
+    const body = { token: this.token, v: this.v, taskSeq: this.state.taskSeq, rc, rh: have, lr: this.lastReactionId, msgs };
+    const t0 = Date.now();
+    try {
+      const res = await fetch(apiUrl(`/api/room/${w.code}`), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (gen !== this.pollGen) return;
+      if (res.status === 503) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        this.wanted = null;
+        this.set({ fatal: { message: data.error ?? "The game server isn't ready yet." }, status: "idle", room: null });
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { v: number; now: number; msgs: ServerMsg[]; retry?: boolean };
+      if (gen !== this.pollGen) return;
+      const t1 = Date.now();
+      const rtt = t1 - t0;
+      if (rtt <= this.bestRtt) {
+        this.bestRtt = rtt;
+        this.set({ offset: data.now + rtt / 2 - t1 });
+      }
+      if (data.retry) {
+        this.pollQueue.unshift(...msgs);
+        this.polling = false;
+        this.schedulePoll(250);
+        return;
+      }
+      this.v = data.v;
+      this.attempts = 0;
+      for (const m of data.msgs) this.onMessage(m);
+      if (!this.wanted || this.state.fatal) return;
+      if (this.state.room && this.state.status !== "open") this.set({ status: "open" });
+      this.polling = false;
+      this.schedulePoll(this.pollQueue.length ? 0 : this.pollInterval());
+    } catch {
+      if (gen !== this.pollGen) return;
+      this.pollQueue.unshift(...msgs);
+      if (this.state.room) this.set({ status: "reconnecting" });
+      const delay = Math.min(8000, 500 * 2 ** this.attempts) * (0.75 + Math.random() * 0.5);
+      this.attempts++;
+      this.polling = false;
+      this.schedulePoll(delay);
+    } finally {
+      if (gen === this.pollGen) this.polling = false;
     }
   }
 
@@ -192,6 +308,7 @@ class GameClient {
     switch (msg.type) {
       case "welcome":
         this.attempts = 0;
+        this.token = msg.token;
         if (this.wanted) storage.setSession({ code: this.wanted.code, token: msg.token });
         this.set({ playerId: msg.playerId, status: "open", fatal: null });
         this.flushOnState = true;
@@ -233,6 +350,10 @@ class GameClient {
       }
 
       case "reaction": {
+        if (msg.id) {
+          if (msg.id <= this.lastReactionId) return;
+          this.lastReactionId = msg.id;
+        }
         const r: FloatingReaction = { id: ++this.reactionId, emoji: msg.emoji, playerId: msg.playerId, x: 8 + Math.random() * 84 };
         this.set({ reactions: [...this.state.reactions, r].slice(-30) });
         setTimeout(() => this.set({ reactions: this.state.reactions.filter((x) => x.id !== r.id) }), 2600);
@@ -240,8 +361,8 @@ class GameClient {
       }
 
       case "error":
-        if (msg.code === "in_progress" || msg.code === "full" || msg.code === "kicked") {
-          if (msg.code === "kicked") storage.setSession(null);
+        if (msg.code === "in_progress" || msg.code === "full" || msg.code === "kicked" || msg.code === "gone") {
+          if (msg.code === "kicked" || msg.code === "gone") storage.setSession(null);
           this.wanted = null;
           this.set({ fatal: { message: msg.message, code: msg.code }, status: "idle", room: null });
           this.teardown();

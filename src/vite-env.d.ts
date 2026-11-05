@@ -3,6 +3,8 @@
 interface ImportMetaEnv {
   /** Where the game server lives, e.g. https://doodle-chain.yourname.workers.dev. Empty = same site. */
   readonly VITE_GAME_SERVER?: string;
+  /** "poll" on Vercel: check in over HTTP instead of a WebSocket. */
+  readonly VITE_TRANSPORT?: string;
 }
 interface ImportMeta {
   readonly env: ImportMetaEnv;

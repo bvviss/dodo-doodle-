@@ -11,5 +11,5 @@
     "isolatedModules": true,
     "types": ["node"]
   },
-  "include": ["tests", "vite.config.ts", "vitest.config.ts", "worker/room.ts", "shared"]
+  "include": ["tests", "vite.config.ts", "vitest.config.ts", "worker/room.ts", "shared", "server", "scripts"]
 }

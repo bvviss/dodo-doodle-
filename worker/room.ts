@@ -5,6 +5,10 @@
 // `Connection` interface. That lets tests run whole games instantly with a
 // fake clock (see tests/room.test.ts). The Durable Object in worker/index.ts
 // just creates one GameRoom and forwards WebSocket messages to it.
+//
+// A room can also be saved (toSnapshot) and loaded back (fromSnapshot). The
+// Vercel version (api/) does that on every request and uses "poll" presence:
+// players count as online while they keep checking in.
 
 import {
   GRACE_MS,
@@ -85,7 +89,67 @@ interface Player {
   lastReaction: number;
   taskSeq: number;
   sentTaskSeq: number;
-  leaveTimer: TimerHandle | null;
+  /** Online right now (socket open, or checked in recently in poll mode). */
+  online: boolean;
+  /** Last check-in time (poll mode). */
+  lastSeen: number;
+}
+
+/** Timers are plain data so a room can be saved and loaded. */
+type NamedTimer =
+  | { id: number; at: number; kind: "endTurn"; turn: number }
+  | { id: number; at: number; kind: "bot"; pid: string; turn: number }
+  | { id: number; at: number; kind: "leave"; pid: string }
+  | { id: number; at: number; kind: "abandon" };
+type TimerSpec = NamedTimer extends infer T ? (T extends NamedTimer ? Omit<T, "id"> : never) : never;
+
+export type Presence = "socket" | "poll";
+
+/** A saved room: plain JSON. */
+export interface RoomSnapshot {
+  v: 1;
+  players: Omit<Player, "conn">[];
+  hostId: string | null;
+  phase: Phase;
+  settings: Settings;
+  customWords: string[];
+  seats: string[];
+  totalTurns: number;
+  turn: number;
+  deadline: number | null;
+  chains: Step[][];
+  ts: {
+    kind: TurnKind;
+    tasks: [string, Task][];
+    chainOf: [string, number][];
+    submissions: [string, string | Stroke[]][];
+    autosaves: [string, Stroke[]][];
+    dealt: [string, string][];
+  } | null;
+  modifier: ActiveModifier | null;
+  builtinDeck: string[];
+  customDeck: string[];
+  reveal: { chain: number; step: number } | null;
+  scores: ScoreLine[] | null;
+  timers: NamedTimer[];
+  timerSeq: number;
+  reactions: RecentReaction[];
+  reactionSeq: number;
+}
+
+/**
+ * The Vercel version stores drawings separately and loads a room with
+ * placeholder arrays (empty, with a `$ref` key). This spots them.
+ */
+export function isStrokeRef(a: unknown): boolean {
+  return Array.isArray(a) && typeof (a as unknown as { $ref?: unknown }).$ref === "string";
+}
+
+export interface RecentReaction {
+  id: number;
+  emoji: string;
+  playerId: string;
+  at: number;
 }
 
 interface TurnState {
@@ -106,6 +170,10 @@ const BOT_NAMES = [
 export const LOBBY_LEAVE_MS = 90_000;
 /** A room with no connected humans resets after this long. */
 export const ABANDON_MS = 10 * 60_000;
+/** Poll mode: a player who hasn't checked in for this long counts as gone. */
+export const PRESENCE_MS = 12_000;
+/** Poll mode: reactions are kept this long so everyone's next check-in sees them. */
+export const REACTION_KEEP_MS = 8_000;
 export const BOT_MIN_DELAY_MS = 1200;
 export const BOT_MAX_DELAY_MS = 3700;
 
@@ -131,8 +199,6 @@ export class GameRoom {
   private chains: Step[][] = [];
   private ts: TurnState | null = null;
   private modifier: ActiveModifier | null = null;
-  private turnTimer: TimerHandle | null = null;
-  private botTimers: TimerHandle[] = [];
   private builtinDeck: string[] = [];
   private customDeck: string[] = [];
 
@@ -140,11 +206,87 @@ export class GameRoom {
   private reveal: { chain: number; step: number } | null = null;
   private scores: ScoreLine[] | null = null;
 
-  private abandonTimer: TimerHandle | null = null;
+  private timers: NamedTimer[] = [];
+  private timerSeq = 0;
+  private wake: TimerHandle | null = null;
+  private reactions: RecentReaction[] = [];
+  private reactionSeq = 0;
+  readonly presence: Presence;
 
-  constructor(code: string, deps: RoomDeps) {
+  constructor(code: string, deps: RoomDeps, presence: Presence = "socket") {
     this.code = code;
     this.deps = deps;
+    this.presence = presence;
+  }
+
+  // ============================================================ timers
+
+  private schedule(spec: TimerSpec): void {
+    this.timers.push({ ...spec, id: ++this.timerSeq } as NamedTimer);
+    this.armWake();
+  }
+
+  private cancelTimers(match: (t: NamedTimer) => boolean): void {
+    const before = this.timers.length;
+    this.timers = this.timers.filter((t) => !match(t));
+    if (this.timers.length !== before) this.armWake();
+  }
+
+  /** Socket mode: one real timer, set for the earliest named timer. */
+  private armWake(): void {
+    if (this.wake !== null) this.deps.clearTimer(this.wake);
+    this.wake = null;
+    const next = this.nextDue();
+    if (next === null) return;
+    this.wake = this.deps.setTimer(() => {
+      this.wake = null;
+      this.runDue();
+    }, next - this.deps.now());
+  }
+
+  /** When the next timer is due (server time), or null. */
+  nextDue(): number | null {
+    let at: number | null = null;
+    for (const t of this.timers) if (at === null || t.at < at) at = t.at;
+    return at;
+  }
+
+  /** Run every timer that is due, in time order. */
+  runDue(): void {
+    for (let guard = 0; guard < 1000; guard++) {
+      const now = this.deps.now();
+      let next: NamedTimer | null = null;
+      for (const t of this.timers) if (t.at <= now && (!next || t.at < next.at || (t.at === next.at && t.id < next.id))) next = t;
+      if (!next) break;
+      const fired = next;
+      this.timers = this.timers.filter((t) => t !== fired);
+      this.fire(fired);
+    }
+    this.armWake();
+  }
+
+  private fire(t: NamedTimer): void {
+    switch (t.kind) {
+      case "endTurn":
+        if (this.isTurnPhase() && this.turn === t.turn) this.endTurn();
+        return;
+      case "bot": {
+        const p = this.player(t.pid);
+        if (p && this.isTurnPhase() && this.turn === t.turn) this.botSubmit(p);
+        return;
+      }
+      case "leave": {
+        const p = this.player(t.pid);
+        if (p && this.phase === "lobby" && !p.online) {
+          this.removePlayer(p.id);
+          this.broadcast();
+        }
+        return;
+      }
+      case "abandon":
+        this.resetRoom();
+        return;
+    }
   }
 
   // ============================================================ connection API
@@ -160,6 +302,8 @@ export class GameRoom {
     const p = this.player(pid);
     if (!p || p.conn !== conn) return;
     p.conn = null;
+    if (this.presence === "poll") return; // poll mode: presence comes from check-ins
+    p.online = false;
     this.onPlayerLeft(p);
   }
 
@@ -247,13 +391,9 @@ export class GameRoom {
       }
       existing.conn = conn;
       this.conns.set(conn, existing.id);
-      if (existing.leaveTimer) {
-        this.deps.clearTimer(existing.leaveTimer);
-        existing.leaveTimer = null;
-      }
-      this.cancelAbandon();
+      existing.lastSeen = this.deps.now();
       conn.send({ type: "welcome", playerId: existing.id, token: existing.token });
-      this.ensureHost();
+      this.markOnline(existing);
       this.broadcast(existing.id);
       this.sendCurrentReveal(existing);
       return;
@@ -278,7 +418,8 @@ export class GameRoom {
       lastReaction: 0,
       taskSeq: 0,
       sentTaskSeq: -1,
-      leaveTimer: null,
+      online: true,
+      lastSeen: this.deps.now(),
     };
     this.players.push(p);
     this.conns.set(conn, p.id);
@@ -321,7 +462,8 @@ export class GameRoom {
       lastReaction: 0,
       taskSeq: 0,
       sentTaskSeq: -1,
-      leaveTimer: null,
+      online: true,
+      lastSeen: 0,
     });
     this.broadcast();
   }
@@ -339,6 +481,7 @@ export class GameRoom {
   private onKick(host: Player, targetId: unknown): void {
     const target = typeof targetId === "string" ? this.player(targetId) : undefined;
     if (!target || target.id === host.id) return;
+    target.online = false;
     if (target.conn) {
       const c = target.conn;
       this.conns.delete(c);
@@ -352,7 +495,7 @@ export class GameRoom {
 
   private onStart(host: Player): void {
     // Drop anyone who left the lobby.
-    for (const p of [...this.players]) if (!p.isBot && !p.conn) this.removePlayer(p.id);
+    for (const p of [...this.players]) if (!p.isBot && !p.online) this.removePlayer(p.id);
 
     if (this.players.length < LIMITS.minPlayers) {
       return this.errorTo(host, `You need at least ${LIMITS.minPlayers} players to start. Add some bots!`, "not_allowed");
@@ -382,8 +525,8 @@ export class GameRoom {
   private removePlayer(id: string): void {
     const i = this.players.findIndex((p) => p.id === id);
     if (i < 0) return;
-    const [p] = this.players.splice(i, 1);
-    if (p.leaveTimer) this.deps.clearTimer(p.leaveTimer);
+    this.players.splice(i, 1);
+    this.cancelTimers((t) => t.kind === "leave" && t.pid === id);
     if (this.hostId === id) {
       this.hostId = null;
       this.ensureHost();
@@ -393,42 +536,44 @@ export class GameRoom {
   /** Host = first player. If the host is gone, pass to the next connected human. */
   private ensureHost(): void {
     const host = this.hostId ? this.player(this.hostId) : undefined;
-    if (host && !host.isBot && host.conn) return;
-    const next = this.players.find((p) => !p.isBot && p.conn);
+    if (host && !host.isBot && host.online) return;
+    const next = this.players.find((p) => !p.isBot && p.online);
     if (next) this.hostId = next.id;
     else if (!host) this.hostId = this.players.find((p) => !p.isBot)?.id ?? null;
   }
 
   private onPlayerLeft(p: Player): void {
     this.ensureHost();
+    const now = this.deps.now();
     if (this.phase === "lobby") {
-      p.leaveTimer = this.deps.setTimer(() => {
-        p.leaveTimer = null;
-        if (this.phase === "lobby" && !p.conn && this.player(p.id)) {
-          this.removePlayer(p.id);
-          this.broadcast();
-        }
-      }, LOBBY_LEAVE_MS);
+      this.cancelTimers((t) => t.kind === "leave" && t.pid === p.id);
+      this.schedule({ kind: "leave", at: now + LOBBY_LEAVE_MS, pid: p.id });
     }
-    if (!this.players.some((x) => !x.isBot && x.conn)) {
+    if (!this.players.some((x) => !x.isBot && x.online)) {
       this.cancelAbandon();
-      this.abandonTimer = this.deps.setTimer(() => this.resetRoom(), ABANDON_MS);
+      this.schedule({ kind: "abandon", at: now + ABANDON_MS });
     }
     if (this.isTurnPhase() && this.checkTurnComplete()) return;
     this.broadcast();
   }
 
+  /** A player is (back) online: cancel their removal and make sure there's a host. */
+  private markOnline(p: Player): void {
+    p.online = true;
+    this.cancelTimers((t) => t.kind === "leave" && t.pid === p.id);
+    this.cancelAbandon();
+    this.ensureHost();
+  }
+
   private cancelAbandon(): void {
-    if (this.abandonTimer) this.deps.clearTimer(this.abandonTimer);
-    this.abandonTimer = null;
+    this.cancelTimers((t) => t.kind === "abandon");
   }
 
   /** Everyone left long ago: start fresh so the code can be reused. */
   private resetRoom(): void {
-    this.abandonTimer = null;
-    if (this.players.some((p) => !p.isBot && p.conn)) return;
-    this.clearTurnTimers();
-    for (const p of this.players) if (p.leaveTimer) this.deps.clearTimer(p.leaveTimer);
+    if (this.players.some((p) => !p.isBot && p.online)) return;
+    this.timers = [];
+    this.armWake();
     this.players = [];
     this.hostId = null;
     this.phase = "lobby";
@@ -496,18 +641,13 @@ export class GameRoom {
       p.taskSeq++;
     });
 
-    this.turnTimer = this.deps.setTimer(() => this.endTurn(), this.deadline + GRACE_MS - now);
+    this.schedule({ kind: "endTurn", at: this.deadline + GRACE_MS, turn: this.turn });
 
-    const turnAtStart = this.turn;
     for (const pid of this.seats) {
       const p = this.player(pid)!;
       if (!p.isBot) continue;
       const delay = startsAt - now + BOT_MIN_DELAY_MS + this.deps.random() * (BOT_MAX_DELAY_MS - BOT_MIN_DELAY_MS);
-      this.botTimers.push(
-        this.deps.setTimer(() => {
-          if (this.isTurnPhase() && this.turn === turnAtStart) this.botSubmit(p);
-        }, delay),
-      );
+      this.schedule({ kind: "bot", at: now + delay, pid, turn: this.turn });
     }
     this.broadcast();
   }
@@ -592,23 +732,20 @@ export class GameRoom {
     if (!ts || !this.isTurnPhase()) return false;
     const anyHuman = this.seats.some((id) => {
       const p = this.player(id);
-      return p && !p.isBot && p.conn;
+      return p && !p.isBot && p.online;
     });
     // With nobody connected, keep waiting for the deadline instead of racing ahead.
     if (!anyHuman) return false;
     const allDone = this.seats.every((id) => {
       const p = this.player(id);
-      return !p || ts.submissions.has(id) || (!p.isBot && !p.conn);
+      return !p || ts.submissions.has(id) || (!p.isBot && !p.online);
     });
     if (allDone) this.endTurn();
     return allDone;
   }
 
   private clearTurnTimers(): void {
-    if (this.turnTimer) this.deps.clearTimer(this.turnTimer);
-    this.turnTimer = null;
-    for (const t of this.botTimers) this.deps.clearTimer(t);
-    this.botTimers = [];
+    this.cancelTimers((t) => t.kind === "endTurn" || t.kind === "bot");
   }
 
   private endTurn(): void {
@@ -708,7 +845,7 @@ export class GameRoom {
     const i = s.votes.indexOf(p.id);
     if (i >= 0) s.votes.splice(i, 1);
     else s.votes.push(p.id);
-    const eligible = this.players.filter((x) => !x.isBot && x.conn && x.id !== s.authorId).length;
+    const eligible = this.players.filter((x) => !x.isBot && x.online && x.id !== s.authorId).length;
     s.match = finalMatch(s.autoMatch, s.votes.length, voteThreshold(eligible));
     this.broadcast();
   }
@@ -718,7 +855,9 @@ export class GameRoom {
     const now = this.deps.now();
     if (now - p.lastReaction < REACTION_COOLDOWN_MS) return;
     p.lastReaction = now;
-    this.broadcastMsg({ type: "reaction", emoji, playerId: p.id });
+    const r: RecentReaction = { id: ++this.reactionSeq, emoji, playerId: p.id, at: now };
+    this.reactions = [...this.reactions.filter((x) => now - x.at < REACTION_KEEP_MS), r].slice(-30);
+    this.broadcastMsg({ type: "reaction", emoji, playerId: p.id, id: r.id });
   }
 
   private onGetChain(p: Player, chain: unknown): void {
@@ -736,7 +875,7 @@ export class GameRoom {
   }
 
   private onPlayAgain(): void {
-    for (const p of [...this.players]) if (!p.isBot && !p.conn) this.removePlayer(p.id);
+    for (const p of [...this.players]) if (!p.isBot && !p.online) this.removePlayer(p.id);
     this.phase = "lobby";
     this.seats = [];
     this.chains = [];
@@ -753,6 +892,149 @@ export class GameRoom {
       p.taskSeq++;
     }
     this.broadcast();
+  }
+
+  // ============================================================ poll mode (Vercel)
+
+  /** The human player with this token, if any. */
+  playerIdByToken(token: unknown): string | null {
+    if (typeof token !== "string" || !token) return null;
+    return this.players.find((p) => !p.isBot && p.token === token)?.id ?? null;
+  }
+
+  /** Record a check-in time for a player (poll mode). */
+  seen(pid: string, at: number): void {
+    const p = this.player(pid);
+    if (p && !p.isBot && at > p.lastSeen) p.lastSeen = at;
+  }
+
+  /** Poll mode: players who checked in are online; those who stopped checking in have left. */
+  sweepPresence(): void {
+    if (this.presence !== "poll") return;
+    const now = this.deps.now();
+    for (const p of [...this.players]) {
+      if (p.isBot || !this.player(p.id)) continue;
+      const fresh = now - p.lastSeen < PRESENCE_MS;
+      if (fresh && !p.online) {
+        this.markOnline(p);
+        if (!(this.isTurnPhase() && this.checkTurnComplete())) this.broadcast();
+      } else if (!fresh && p.online) {
+        p.online = false;
+        this.onPlayerLeft(p);
+      }
+    }
+  }
+
+  /** Poll mode: link a one-request connection to a known player. */
+  attach(conn: Connection, pid: string): void {
+    const p = this.player(pid);
+    if (!p) return;
+    p.conn = conn;
+    this.conns.set(conn, pid);
+  }
+
+  /** Poll mode: unlink a one-request connection (this does not mean the player left). */
+  detach(conn: Connection): void {
+    const pid = this.conns.get(conn);
+    this.conns.delete(conn);
+    const p = pid ? this.player(pid) : undefined;
+    if (p && p.conn === conn) p.conn = null;
+  }
+
+  /**
+   * Poll mode: send this player everything they're missing: the current state
+   * (with their task if it changed), new reveal steps and recent reactions.
+   */
+  catchUp(pid: string, client: { taskSeq: number; revealChain: number; revealHave: number; lastReaction: number }): void {
+    const p = this.player(pid);
+    const conn = p?.conn;
+    if (!p || !conn) return;
+    p.sentTaskSeq = client.taskSeq;
+    this.sendState(p);
+    const r = this.reveal;
+    if (this.phase === "reveal" && r) {
+      const have = client.revealChain === r.chain ? Math.max(0, Math.min(client.revealHave, r.step + 1)) : 0;
+      if (have <= r.step) conn.send(this.revealDataMsg(r.chain, have, r.step + 1 - have));
+    }
+    const now = this.deps.now();
+    for (const x of this.reactions) {
+      if (x.id > client.lastReaction && now - x.at < REACTION_KEEP_MS && x.playerId !== pid) {
+        conn.send({ type: "reaction", emoji: x.emoji, playerId: x.playerId, id: x.id });
+      }
+    }
+  }
+
+  // ============================================================ save / load
+
+  toSnapshot(): RoomSnapshot {
+    const ts = this.ts;
+    return {
+      v: 1,
+      players: this.players.map(({ conn: _conn, ...rest }) => rest),
+      hostId: this.hostId,
+      phase: this.phase,
+      settings: this.settings,
+      customWords: this.customWords,
+      seats: this.seats,
+      totalTurns: this.totalTurns,
+      turn: this.turn,
+      deadline: this.deadline,
+      chains: this.chains,
+      ts: ts
+        ? {
+            kind: ts.kind,
+            tasks: [...ts.tasks],
+            chainOf: [...ts.chainOf],
+            submissions: [...ts.submissions],
+            autosaves: [...ts.autosaves],
+            dealt: [...ts.dealt],
+          }
+        : null,
+      modifier: this.modifier,
+      builtinDeck: this.builtinDeck,
+      customDeck: this.customDeck,
+      reveal: this.reveal,
+      scores: this.scores,
+      timers: this.timers,
+      timerSeq: this.timerSeq,
+      reactions: this.reactions,
+      reactionSeq: this.reactionSeq,
+    };
+  }
+
+  static fromSnapshot(code: string, deps: RoomDeps, snap: RoomSnapshot, presence: Presence = "socket"): GameRoom {
+    const room = new GameRoom(code, deps, presence);
+    room.players = snap.players.map((p) => ({ ...p, conn: null, lastSeen: p.lastSeen ?? 0, sentTaskSeq: p.sentTaskSeq ?? -1 }));
+    room.hostId = snap.hostId;
+    room.phase = snap.phase;
+    room.settings = snap.settings;
+    room.customWords = snap.customWords;
+    room.seats = snap.seats;
+    room.totalTurns = snap.totalTurns;
+    room.turn = snap.turn;
+    room.deadline = snap.deadline;
+    room.chains = snap.chains;
+    room.ts = snap.ts
+      ? {
+          kind: snap.ts.kind,
+          tasks: new Map(snap.ts.tasks),
+          chainOf: new Map(snap.ts.chainOf),
+          submissions: new Map(snap.ts.submissions),
+          autosaves: new Map(snap.ts.autosaves),
+          dealt: new Map(snap.ts.dealt),
+        }
+      : null;
+    room.modifier = snap.modifier;
+    room.builtinDeck = snap.builtinDeck;
+    room.customDeck = snap.customDeck;
+    room.reveal = snap.reveal;
+    room.scores = snap.scores;
+    room.timers = snap.timers;
+    room.timerSeq = snap.timerSeq;
+    room.reactions = snap.reactions;
+    room.reactionSeq = snap.reactionSeq;
+    room.armWake();
+    return room;
   }
 
   // ============================================================ output
@@ -781,7 +1063,7 @@ export class GameRoom {
       name: p.name,
       colour: p.colour,
       isBot: p.isBot,
-      connected: p.isBot || !!p.conn,
+      connected: p.isBot || p.online,
       score: p.score,
       done: !!ts && ts.submissions.has(p.id),
     }));
@@ -825,7 +1107,7 @@ export class GameRoom {
     if (!task) return null;
     if (task.kind === "draw") {
       const draft = ts.autosaves.get(p.id);
-      if (draft && draft.length) return { ...task, draft };
+      if (draft && (draft.length || isStrokeRef(draft))) return { ...task, draft };
     }
     return task;
   }

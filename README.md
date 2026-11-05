@@ -20,7 +20,7 @@ drawing, and score points for accurate guesses.
 2. [Run the game on your computer](#2-run-the-game-on-your-computer)
 3. [Play with friends on the same wifi](#3-play-with-friends-on-the-same-wifi)
 4. [Put it online for free (Cloudflare)](#4-put-it-online-for-free-cloudflare)
-   - [Optional: website on Vercel](#optional-host-the-website-on-vercel)
+   - [Or: put it online on Vercel](#or-put-it-online-on-vercel)
 5. [Change the game's name or web address](#5-change-the-games-name-or-web-address)
 6. [Add your own words](#6-add-your-own-words)
 7. [What does it cost?](#7-what-does-it-cost)
@@ -119,30 +119,36 @@ that anyone can open from anywhere.
 Whenever you change something (like adding words), just run `npm run deploy`
 again to update the online version.
 
-### Optional: host the website on Vercel
+### Or: put it online on Vercel
 
-You can put the **website** on Vercel (link like `https://doodle-chain.vercel.app`)
-while the **game server** stays on Cloudflare. The game server has to stay on
-Cloudflare: it keeps one always-on "referee" per room, which Vercel doesn't
-offer. Both are free.
+Prefer Vercel? The game can run there completely, with no Cloudflare account.
 
-1. First do all of step 4 above. Write down your Cloudflare link, e.g.
-   `https://doodle-chain.yourname.workers.dev` — that's your **game server address**.
-2. Create a free account at https://vercel.com/signup and choose **Continue with GitHub**.
-3. Click **Add New… → Project**, find **dodo-doodle-** in the list and click **Import**.
-4. Before clicking Deploy, open **Environment Variables** and add one:
-   - **Key:** `VITE_GAME_SERVER`
-   - **Value:** your game server address from step 1 (no slash at the end)
-5. Click **Deploy**. Vercel reads the rest of the setup from `vercel.json`.
-   When it finishes you get a link like `https://dodo-doodle.vercel.app`. Share that one!
+**How it differs:** Vercel can't keep a live connection open to every phone,
+so each phone checks in with the server about once a second, and the game is
+kept in a small free database (**Upstash Redis**, added from inside Vercel).
+Moves show up on other screens up to about a second later than on Cloudflare,
+and the free database limits mean roughly a few dozen games a month — plenty
+for a friend group.
 
-From then on, Vercel updates the website automatically every time the `main`
-branch on GitHub changes. If you change the **game server** code
-(`worker/` or `shared/`), also run `npm run deploy` so Cloudflare gets it too.
+1. Create a free account at https://vercel.com/signup and choose **Continue with GitHub**.
+2. Click **Add New… → Project**, find **dodo-doodle-** and click **Import**, then **Deploy**.
+   (Vercel reads the setup from `vercel.json`; you don't need to change anything.)
+3. Add the database: open the project → **Storage** → **Create Database** →
+   **Upstash for Redis** → pick the **Free** plan and the region closest to
+   your friends (for Malaysia: **Singapore**) → **Create** → **Connect** to this project.
+4. Go to **Deployments**, open the menu (⋯) on the newest one and click **Redeploy**,
+   so the game picks up the database.
+5. Open your link (like `https://dodo-doodle.vercel.app`) and play!
 
-If you ever change the game server address, update `VITE_GAME_SERVER` in
-Vercel (**Project → Settings → Environment Variables**) and click **Redeploy**
-on the latest deployment.
+From then on, Vercel updates the game automatically every time the `main`
+branch on GitHub changes.
+
+To try the Vercel version on your computer (no database needed — it keeps
+everything in memory):
+
+```bash
+npm run dev:vercel
+```
 
 ## 5. Change the game's name or web address
 
@@ -214,8 +220,8 @@ npm run deploy
 | "Reconnecting…" banner | The internet blinked. It reconnects by itself; you land back in the same turn with your drawing restored. |
 | "This game is already in progress" | New players can only join in the lobby. Wait for the host to press **Play again**. |
 | `wrangler login` doesn't open a browser | Copy the link the terminal prints into your browser. |
-| Vercel build fails with "VITE_GAME_SERVER is not set" | Add the environment variable from the Vercel steps above, then redeploy. |
-| Vercel site loads but "Couldn't create a room" | Check `VITE_GAME_SERVER` is exactly your Cloudflare link (starts with `https://`, no slash at the end), and that `npm run deploy` finished. |
+| Vercel: "The game database isn't connected yet" | Do steps 3 and 4 of the Vercel section (add Upstash Redis, then Redeploy). |
+| Vercel: moves feel a bit slow | That's the once-a-second check-in. Pick the database region closest to your friends; the game server runs in Singapore (`GAME_REGION` in `scripts/build-vercel.mjs`). |
 
 ## 9. For the curious: how it's built
 
@@ -224,6 +230,7 @@ npm run deploy
 | `src/` | The website (React). `screens/` holds each screen; `canvas/` the drawing tools, replay and picture export. |
 | `worker/room.ts` | The **referee**: rooms, turns, timers, bots, scoring. Plain TypeScript, so it can be tested without Cloudflare. |
 | `worker/index.ts` | The Cloudflare Worker + one **Durable Object per room code** that holds the referee. |
+| `server/` | The Vercel version of the game server: loads the referee from Upstash Redis on each check-in, then saves it. |
 | `shared/` | Code used by both sides: message types (`types.ts`), rules and scoring (`rules.ts`), word packs (`words.ts`). |
 | `tests/` | Automatic checks, including whole simulated games with bots and a fake clock. |
 
