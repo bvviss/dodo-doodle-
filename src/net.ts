@@ -4,6 +4,7 @@
 
 import { useSyncExternalStore } from "react";
 import type { ClientMsg, ErrorCode, PublicRoom, ServerMsg, Step, Task } from "../shared/types";
+import { wsUrl } from "./server";
 import { storage } from "./storage";
 
 export type Status = "idle" | "connecting" | "open" | "reconnecting";
@@ -125,8 +126,7 @@ class GameClient {
     this.teardown();
     const w = this.wanted;
     if (!w) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/api/room/${w.code}/ws`);
+    const ws = new WebSocket(wsUrl(`/api/room/${w.code}/ws`));
     this.ws = ws;
 
     ws.onopen = () => {

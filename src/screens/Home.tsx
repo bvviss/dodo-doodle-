@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { LIMITS, PLAYER_COLOURS, ROOM_CODE_RE } from "../../shared/types";
 import { client, useGame } from "../net";
+import { apiUrl } from "../server";
 import { storage } from "../storage";
 import { Logo } from "../ui";
 
@@ -34,7 +35,7 @@ export function Home({ urlCode }: { urlCode: string | null }) {
     setBusy(true);
     setProblem(null);
     try {
-      const res = await fetch("/api/new");
+      const res = await fetch(apiUrl("/api/new"));
       const data = (await res.json()) as { code?: string };
       if (!data.code) throw new Error("no code");
       enter(data.code);
