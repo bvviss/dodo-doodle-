@@ -84,7 +84,7 @@ export function Scores() {
                   {p?.isBot && <span className="tag">bot</span>}
                 </div>
                 <div className="detail">
-                  🎯 {s.exact} exact · 👌 {s.close} close · 🔗 +{s.chainBonus} chain bonus
+                  🎯 {s.exact} exact · 👌 {s.close} close{s.chainBonus ? ` · 🔗 +${s.chainBonus} bonus` : ""}
                 </div>
               </div>
               <div className="pts">{s.points}</div>
