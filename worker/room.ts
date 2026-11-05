@@ -852,7 +852,7 @@ export class GameRoom {
 
 /** A few random coloured loops and lines. */
 export function botDrawing(random: () => number): Stroke[] {
-  const colours = PALETTE.filter((c) => c !== "#ffffff");
+  const colours = PALETTE.filter((c) => c !== "#ffffff" && c !== "#d1d1d1");
   const strokes: Stroke[] = [];
   const count = 2 + Math.floor(random() * 4);
   let t = 0;

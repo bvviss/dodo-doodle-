@@ -4,6 +4,10 @@ import { client, useGame } from "./net";
 import { storage } from "./storage";
 import { Home } from "./screens/Home";
 import { Lobby } from "./screens/Lobby";
+import { Prompt } from "./screens/Prompt";
+import { Draw } from "./screens/Draw";
+import { Guess } from "./screens/Guess";
+import { Waiting } from "./screens/Waiting";
 import { ConnectionBanner, Floaters, Toast } from "./ui";
 
 function codeFromPath(): string | null {
@@ -46,7 +50,7 @@ export function App() {
 }
 
 function Screen({ urlCode }: { urlCode: string | null }) {
-  const { room, status } = useGame();
+  const { room, status, submitted, task } = useGame();
   if (!room) {
     if (status === "connecting" || status === "reconnecting") {
       return (
@@ -61,11 +65,19 @@ function Screen({ urlCode }: { urlCode: string | null }) {
   switch (room.phase) {
     case "lobby":
       return <Lobby />;
+    case "prompt":
+    case "draw":
+    case "guess":
+      // key = turn: every turn starts with a fresh screen.
+      if (submitted || !task) return <Waiting key={`w${room.turn}`} />;
+      if (task.kind === "prompt") return <Prompt key={room.turn} />;
+      if (task.kind === "draw") return <Draw key={room.turn} />;
+      return <Guess key={room.turn} />;
     default:
       return (
         <div className="app center-text" style={{ paddingTop: 80 }}>
-          <h2>The game has started!</h2>
-          <p className="muted">Game screens arrive in the next milestone.</p>
+          <h2>All chains are done! 🎉</h2>
+          <p className="muted">The reveal screen arrives in milestone 4.</p>
         </div>
       );
   }

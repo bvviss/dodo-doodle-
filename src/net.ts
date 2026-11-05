@@ -96,6 +96,7 @@ class GameClient {
 
   leave() {
     this.wanted = null;
+    this.pending = [];
     storage.setSession(null);
     this.teardown();
     this.set({ ...initial });
@@ -165,8 +166,17 @@ class GameClient {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
 
+  /** Messages that must not be lost while reconnecting (sent after the next welcome). */
+  private pending: { msg: ClientMsg; seq: number }[] = [];
+  private flushOnState = false;
+
   send(msg: ClientMsg) {
-    this.sendRaw(msg);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.state.status === "open") {
+      this.ws.send(JSON.stringify(msg));
+    } else if (msg.type === "submit" || msg.type === "autosave") {
+      // Remember it for the same task only.
+      this.pending = [...this.pending.filter((p) => p.msg.type !== msg.type), { msg, seq: this.state.taskSeq }];
+    }
   }
 
   /** Called when the page becomes visible again (phones pause sockets in the background). */
@@ -184,6 +194,7 @@ class GameClient {
         this.attempts = 0;
         if (this.wanted) storage.setSession({ code: this.wanted.code, token: msg.token });
         this.set({ playerId: msg.playerId, status: "open", fatal: null });
+        this.flushOnState = true;
         return;
 
       case "state": {
@@ -194,6 +205,11 @@ class GameClient {
         // New game: forget old chains.
         if (msg.room.phase === "lobby" || (msg.room.phase === "prompt" && prev?.phase !== "prompt")) patch.chains = {};
         this.set(patch);
+        if (this.flushOnState) {
+          this.flushOnState = false;
+          // Only resend answers for the task that is still current.
+          for (const p of this.pending.splice(0)) if (p.seq === msg.you.taskSeq && !msg.you.submitted) this.sendRaw(p.msg);
+        }
         return;
       }
 
