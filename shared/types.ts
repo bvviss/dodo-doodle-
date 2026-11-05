@@ -257,13 +257,13 @@ export type ClientMsg =
   | { type: "playAgain" }
   | { type: "ping"; t: number };
 
-export type ErrorCode = "in_progress" | "full" | "kicked" | "bad_request" | "not_allowed";
+export type ErrorCode = "in_progress" | "full" | "kicked" | "gone" | "bad_request" | "not_allowed";
 
 export type ServerMsg =
   | { type: "welcome"; playerId: string; token: string }
   | { type: "state"; room: PublicRoom; you: You; serverNow: number }
   | { type: "revealData"; chainIndex: number; ownerId: string; fromStep: number; steps: Step[] }
   | { type: "chain"; chainIndex: number; ownerId: string; steps: Step[] }
-  | { type: "reaction"; emoji: string; playerId: string }
+  | { type: "reaction"; emoji: string; playerId: string; id?: number }
   | { type: "error"; message: string; code?: ErrorCode }
   | { type: "pong"; t: number; serverNow: number };
