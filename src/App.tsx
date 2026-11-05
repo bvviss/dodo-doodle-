@@ -8,6 +8,8 @@ import { Prompt } from "./screens/Prompt";
 import { Draw } from "./screens/Draw";
 import { Guess } from "./screens/Guess";
 import { Waiting } from "./screens/Waiting";
+import { Reveal } from "./screens/Reveal";
+import { Scores } from "./screens/Scores";
 import { ConnectionBanner, Floaters, Toast } from "./ui";
 
 function codeFromPath(): string | null {
@@ -73,12 +75,9 @@ function Screen({ urlCode }: { urlCode: string | null }) {
       if (task.kind === "prompt") return <Prompt key={room.turn} />;
       if (task.kind === "draw") return <Draw key={room.turn} />;
       return <Guess key={room.turn} />;
-    default:
-      return (
-        <div className="app center-text" style={{ paddingTop: 80 }}>
-          <h2>All chains are done! 🎉</h2>
-          <p className="muted">The reveal screen arrives in milestone 4.</p>
-        </div>
-      );
+    case "reveal":
+      return <Reveal />;
+    case "scores":
+      return <Scores />;
   }
 }

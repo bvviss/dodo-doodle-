@@ -694,7 +694,8 @@ export class GameRoom {
       if (p) p.score = line.points;
     }
     this.phase = "scores";
-    this.reveal = null;
+    // Keep the pointer at the very end so clients know how many chains there are.
+    this.reveal = { chain: this.chains.length - 1, step: this.totalTurns - 1 };
     this.broadcast();
   }
 
