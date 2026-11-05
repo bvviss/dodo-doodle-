@@ -592,6 +592,16 @@ textarea.input {
 .canvas-frame.clickable {
   cursor: pointer;
 }
+.play .canvas-frame {
+  /* Keep the canvas, toolbar and Done button on one laptop screen. */
+  max-width: max(300px, calc((100dvh - 400px) * 4 / 3));
+  margin: 0 auto;
+}
+.play .toolbar {
+  max-width: max(300px, calc((100dvh - 400px) * 4 / 3));
+  width: 100%;
+  margin: 0 auto;
+}
 .draw-layout {
   display: flex;
   flex-direction: column;
@@ -675,10 +685,33 @@ textarea.input {
   align-self: stretch;
   background: var(--paper-dot);
 }
+.tool-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+}
 @media (max-width: 520px) {
   .toolbar {
-    padding: 8px;
+    padding: 8px 6px;
     gap: 8px;
+  }
+  .tool-row {
+    flex-wrap: nowrap;
+    gap: 3px;
+    width: 100%;
+  }
+  .tool-row .tool-group {
+    display: contents;
+  }
+  .tool-row .tool-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+    height: 38px;
+    font-size: 17px;
+    border-radius: 8px;
   }
   .palette {
     grid-template-columns: repeat(8, 1fr);
@@ -690,10 +723,6 @@ textarea.input {
   }
   .palette.few {
     grid-template-columns: repeat(3, 1fr);
-  }
-  .tool-btn {
-    width: 40px;
-    height: 40px;
   }
   .divider {
     display: none;
